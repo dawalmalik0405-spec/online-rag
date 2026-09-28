@@ -1,0 +1,31 @@
+# ---------------- Core Backend ----------------
+fastapi
+uvicorn
+
+# ---------------- File Upload & Templates ----------------
+python-multipart
+jinja2
+
+# ---------------- LangChain Core ----------------
+langchain
+langchain-core
+langchain-community
+langchain-huggingface
+langchain-groq
+langchain-nvidia-ai-endpoints
+
+# ---------------- Embeddings & ML ----------------
+torch
+transformers
+sentence-transformers
+
+# ---------------- Vector Database ----------------
+chromadb
+
+# ---------------- Environment Variables ----------------
+python-dotenv
+
+# ---------------- Utilities ----------------
+pydantic
+tqdm
+numpy

@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG AI Assistant</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+
+<div class="app">
+
+    <!-- ===== SIDEBAR ===== -->
+    <div class="side-bar">
+        <h2>Documents</h2>
+
+        <div id="file-list" class="file-list">
+            <!-- Files injected here -->
+        </div>
+
+        <label for="file-upload" class="upload-btn">＋ Upload</label>
+        <input type="file" id="file-upload" hidden onchange="uploadFile()" />
+    </div>
+
+    <!-- ===== CHAT AREA ===== -->
+    <div class="chat-container">
+
+        <div class="chat-header">
+            <button id="toggle-btn" onclick="toggleSidebar()">☰</button>
+            <span>RAG AI Assistant</span>
+            <span id="active-file"></span>
+        </div>
+
+        <div id="chat-box" class="chat-box">
+            <div class="ai-message">
+                Upload a document (.pdf, .txt, .docx, .md) and select it to start chatting.
+            </div>
+        </div>
+
+        <div class="chat-input">
+            <input
+                type="text"
+                id="user-input"
+                placeholder="Select a document first..."
+                disabled
+                onkeydown="if(event.key==='Enter') sendMessage()"
+            />
+            <button onclick="sendMessage()">➤</button>
+        </div>
+
+    </div>
+</div>
+
+<script>
+let selectedFile = "";
+
+/* ================= LOAD FILES ================= */
+async function loadFiles() {
+    try {
+        const res = await fetch("/files");
+        const data = await res.json();
+
+        const fileList = document.getElementById("file-list");
+        fileList.innerHTML = "";
+
+        if (data.files.length === 0) {
+            fileList.innerHTML = `<div style="color: #777; font-size: 13px; padding: 10px;">No documents yet.</div>`;
+            return;
+        }
+
+        data.files.forEach(file => {
+            const div = document.createElement("div");
+            div.className = "file-item" + (file === selectedFile ? " active" : "");
+
+            const nameSpan = document.createElement("span");
+            nameSpan.className = "file-name";
+            nameSpan.innerText = file;
+            nameSpan.title = file;
+
+            const deleteBtn = document.createElement("button");
+            deleteBtn.className = "delete-btn";
+            deleteBtn.innerHTML = "×";
+            deleteBtn.title = "Delete document";
+            deleteBtn.onclick = (e) => deleteFile(e, file);
+
+            div.appendChild(nameSpan);
+            div.appendChild(deleteBtn);
+            div.onclick = () => selectFile(file);
+
+            fileList.appendChild(div);
+        });
+    } catch (err) {
+        console.error("Failed to load files", err);
+    }
+}
+
+/* ================= SELECT FILE ================= */
+async function selectFile(filename) {
+    selectedFile = filename;
+
+    // Highlight active file
+    document.querySelectorAll(".file-item").forEach(el => {
+        const name = el.querySelector(".file-name")?.innerText;
+        el.classList.toggle("active", name === filename);
+    });
+
+    // Update header
+    document.getElementById("active-file").innerText = ` — ${filename}`;
+
+    // Enable input
+    const input = document.getElementById("user-input");
+    input.disabled = false;
+    input.placeholder = `Ask something about ${filename}...`;
+
+    // Clear chat & show loading
+    const chatBox = document.getElementById("chat-box");
+    chatBox.innerHTML = "";
+
+    try {
+        const res = await fetch(`/history?filename=${encodeURIComponent(filename)}`);
+        const data = await res.json();
+
+        if (!data.messages || data.messages.length === 0) {
+            chatBox.innerHTML = `<div class="ai-message">Chatting with <strong>${escapeHtml(filename)}</strong>. Ask any question!</div>`;
+            return;
+        }
+
+        data.messages.forEach(msg => {
+            const div = document.createElement("div");
+            div.className = msg.role === "human" ? "user-message" : "ai-message";
+            if (msg.role === "human") {
+                div.innerText = msg.content;
+            } else {
+                div.innerHTML = typeof marked !== "undefined" ? marked.parse(msg.content) : escapeHtml(msg.content);
+            }
+            chatBox.appendChild(div);
+        });
+
+        chatBox.scrollTop = chatBox.scrollHeight;
+    } catch (err) {
+        chatBox.innerHTML = `<div class="ai-message">Ready to chat with <strong>${escapeHtml(filename)}</strong>.</div>`;
+    }
+}
+
+/* ================= SEND MESSAGE (STREAMING) ================= */
+async function sendMessage() {
+    if (!selectedFile) return;
+
+    const input = document.getElementById("user-input");
+    const chatBox = document.getElementById("chat-box");
+    const message = input.value.trim();
+    if (!message) return;
+
+    const shouldAutoScroll = isUserAtBottom(chatBox);
+
+    // Render user message
+    const userDiv = document.createElement("div");
+    userDiv.className = "user-message";
+    userDiv.innerText = message;
+    chatBox.appendChild(userDiv);
+
+    input.value = "";
+
+    if (shouldAutoScroll) {
+        chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    // Render placeholder message
+    const loadingDiv = document.createElement("div");
+    loadingDiv.className = "ai-message thinking";
+    loadingDiv.innerText = "Searching document & thinking...";
+    chatBox.appendChild(loadingDiv);
+
+    if (shouldAutoScroll) {
+        chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    try {
+        const res = await fetch("/chat/stream", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ message, filename: selectedFile })
+        });
+
+        if (!res.ok) {
+            throw new Error(`HTTP ${res.status}`);
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let accumulatedText = "";
+        let sourcesList = [];
+        let hasStartedStreaming = false;
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop(); // Keep leftover partial line
+
+            for (const line of lines) {
+                if (line.startsWith("data: ")) {
+                    try {
+                        const event = JSON.parse(line.slice(6));
+
+                        if (event.type === "sources") {
+                            sourcesList = event.data || [];
+                        } else if (event.type === "token") {
+                            if (!hasStartedStreaming) {
+                                loadingDiv.classList.remove("thinking");
+                                loadingDiv.innerHTML = "";
+                                hasStartedStreaming = true;
+                            }
+                            accumulatedText += event.data;
+                            loadingDiv.innerHTML = typeof marked !== "undefined"
+                                ? marked.parse(accumulatedText)
+                                : escapeHtml(accumulatedText);
+
+                            if (shouldAutoScroll) {
+                                chatBox.scrollTop = chatBox.scrollHeight;
+                            }
+                        } else if (event.type === "error") {
+                            loadingDiv.classList.remove("thinking");
+                            accumulatedText += `\n\n*Error: ${event.data}*`;
+                            loadingDiv.innerHTML = typeof marked !== "undefined"
+                                ? marked.parse(accumulatedText)
+                                : escapeHtml(accumulatedText);
+                        }
+                    } catch (e) {
+                        // ignore malformed SSE chunks
+                    }
+                }
+            }
+        }
+
+        loadingDiv.classList.remove("thinking");
+
+        // Render sources under the finished message
+        if (sourcesList && sourcesList.length > 0) {
+            const sourcesDetails = document.createElement("details");
+            sourcesDetails.className = "sources-box";
+            sourcesDetails.innerHTML = `<summary>📑 ${sourcesList.length} Retrieved Chunk(s)</summary>`;
+
+            const list = document.createElement("div");
+            list.className = "sources-list";
+            sourcesList.forEach(s => {
+                const item = document.createElement("div");
+                item.className = "source-item";
+                item.innerHTML = `<strong>Chunk #${s.chunk_index}</strong> (Similarity: ${(s.similarity * 100).toFixed(1)}%)<p>${escapeHtml(s.snippet)}</p>`;
+                list.appendChild(item);
+            });
+
+            sourcesDetails.appendChild(list);
+            loadingDiv.appendChild(sourcesDetails);
+        }
+
+    } catch (err) {
+        loadingDiv.classList.remove("thinking");
+        loadingDiv.innerText = "Error: Could not connect to the streaming assistant backend.";
+    }
+
+    if (shouldAutoScroll) {
+        chatBox.scrollTop = chatBox.scrollHeight;
+    }
+}
+
+
+/* ================= UPLOAD FILE ================= */
+async function uploadFile() {
+    const input = document.getElementById("file-upload");
+    const file = input.files[0];
+    if (!file) return;
+
+    const chatBox = document.getElementById("chat-box");
+    const statusDiv = document.createElement("div");
+    statusDiv.className = "ai-message thinking";
+    statusDiv.innerText = `Uploading & indexing "${file.name}"...`;
+    chatBox.appendChild(statusDiv);
+    chatBox.scrollTop = chatBox.scrollHeight;
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+        const res = await fetch("/uploadfile/save/", {
+            method: "POST",
+            body: formData
+        });
+
+        const data = await res.json();
+
+        if (res.ok) {
+            statusDiv.classList.remove("thinking");
+            statusDiv.innerHTML = `✅ Successfully indexed <strong>${escapeHtml(data.filename)}</strong> into ${data.chunks} vector chunk(s).`;
+            await loadFiles();
+            selectFile(data.filename);
+        } else {
+            statusDiv.classList.remove("thinking");
+            statusDiv.style.color = "#ff6b6b";
+            statusDiv.innerText = `Upload failed: ${data.error || "Unknown error"}`;
+        }
+    } catch (err) {
+        statusDiv.classList.remove("thinking");
+        statusDiv.style.color = "#ff6b6b";
+        statusDiv.innerText = "Upload failed: Server connection error.";
+    }
+
+    input.value = "";
+}
+
+/* ================= DELETE FILE ================= */
+async function deleteFile(e, filename) {
+    e.stopPropagation();
+    if (!confirm(`Are you sure you want to delete "${filename}"?`)) {
+        return;
+    }
+
+    try {
+        const res = await fetch(`/files/${encodeURIComponent(filename)}`, {
+            method: "DELETE"
+        });
+
+        if (res.ok) {
+            if (selectedFile === filename) {
+                selectedFile = "";
+                document.getElementById("active-file").innerText = "";
+                document.getElementById("user-input").disabled = true;
+                document.getElementById("user-input").placeholder = "Select a document first...";
+                document.getElementById("chat-box").innerHTML = `
+                    <div class="ai-message">
+                        Upload a document (.pdf, .txt, .docx, .md) and select it to start chatting.
+                    </div>
+                `;
+            }
+            await loadFiles();
+        } else {
+            alert("Failed to delete document.");
+        }
+    } catch (err) {
+        alert("Error deleting document.");
+    }
+}
+
+function toggleSidebar() {
+    document.querySelector(".side-bar").classList.toggle("collapsed");
+}
+
+function isUserAtBottom(container, threshold = 60) {
+    return (container.scrollHeight - container.scrollTop - container.clientHeight < threshold);
+}
+
+function escapeHtml(text) {
+    if (!text) return "";
+    return text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
+
+/* ================= INIT ================= */
+window.onload = loadFiles;
+</script>
+
+</body>
+</html>
+
